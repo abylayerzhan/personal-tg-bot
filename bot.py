@@ -24,11 +24,11 @@ from telegram.ext import (
 load_dotenv()
 
 # ─────────── ENV ───────────
-TOKEN = os.environ["TELEGRAM_TOKEN"]
-OWNER_ID = int(os.environ.get("OWNER_CHAT_ID", "0")) or None
+TOKEN = os.environ["TELEGRAM_TOKEN"].strip()
+OWNER_ID = int(os.environ.get("OWNER_CHAT_ID", "0").strip()) or None
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-WEATHER_CITY = os.environ.get("WEATHER_CITY", "Almaty")
-DB_PATH = os.environ.get("DB_PATH", "data.db")
+WEATHER_CITY = os.environ.get("WEATHER_CITY", "Almaty").strip()
+DB_PATH = os.environ.get("DB_PATH", "data.db").strip()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("stk-bot")
