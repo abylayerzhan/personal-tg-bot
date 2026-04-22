@@ -318,7 +318,7 @@ def ask_claude(question: str) -> str:
         from anthropic import Anthropic
         client = Anthropic(api_key=ANTHROPIC_KEY)
         msg = client.messages.create(
-            model="claude-sonnet-4-5",
+            model="claude-sonnet-4-6",
             max_tokens=512,
             system=("Ты помощник Абылая (STK парфюмерия, Алматы). "
                     "Цены: 30мл=42 580 тг, 50мл=63 700 тг, Kaspi=3 548 тг/мес. "
