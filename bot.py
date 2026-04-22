@@ -6,6 +6,7 @@ STK Telegram Bot — облачная версия
 import os
 import re
 import json
+import asyncio
 import sqlite3
 import logging
 import urllib.parse
@@ -651,7 +652,7 @@ async def morning_job(context: ContextTypes.DEFAULT_TYPE):
     log.info("MORNING DIGEST sent")
 
 # ─────────── Main ───────────
-def main():
+async def run():
     init_db()
     app = Application.builder().token(TOKEN).build()
 
@@ -659,18 +660,25 @@ def main():
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Утренний дайджест в 10:00 (UTC+5 = Almaty)
-    # Render по умолчанию UTC. 10:00 Almaty = 05:00 UTC
     app.job_queue.run_daily(
         morning_job,
-        time=dtime(hour=5, minute=0, second=0),  # UTC
+        time=dtime(hour=5, minute=0, second=0),
         name="morning_digest",
     )
 
     log.info("🤖 STK Bot starting")
     log.info("   OWNER_ID=%s ANTHROPIC=%s CITY=%s",
              OWNER_ID, "ON" if ANTHROPIC_KEY else "OFF", WEATHER_CITY)
-    app.run_polling(drop_pending_updates=True)
+
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(drop_pending_updates=True)
+    try:
+        await asyncio.Event().wait()
+    finally:
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(run())
