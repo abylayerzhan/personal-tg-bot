@@ -1,14 +1,15 @@
 """
 STK Telegram Bot v2 — Notion-синхронизированная облачная версия
 =================================================================
-Новое в v2:
-• Двусторонняя синхронизация с Notion (5 баз: STK, CLOQ, Личное, Идеи, Привычки)
+Фичи:
+• Двусторонняя синхронизация с Notion (4 базы: STK, CLOQ, Личное, Идеи)
 • Голосовые сообщения через Whisper (Groq или OpenAI)
 • LLM-классификатор (Claude Haiku) как fallback
 • Персистентные напоминания (переживают рестарт)
 • Еженедельный отчёт по воскресеньям в 21:00
-• Команды: /sync, /help + текстовые "синк", "отмена"
-• Кнопки "Удалить" и "Отменить" для каждой записи
+• Вечерний итог в 22:00
+• Команды: /sync, /help + текстовые "синк", "отмена", "все"
+• Кнопки "Удалить" / "Готово" / "Отменить" для каждой записи
 """
 import os
 import re
@@ -45,7 +46,6 @@ NOTION_DB_STK = os.environ.get("NOTION_DB_STK", "").strip()
 NOTION_DB_CLOQ = os.environ.get("NOTION_DB_CLOQ", "").strip()
 NOTION_DB_PERSONAL = os.environ.get("NOTION_DB_PERSONAL", "").strip()
 NOTION_DB_IDEAS = os.environ.get("NOTION_DB_IDEAS", "").strip()
-NOTION_DB_HABITS = os.environ.get("NOTION_DB_HABITS", "").strip()
 
 # Voice (хотя бы один)
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
@@ -97,13 +97,6 @@ def init_db():
             early_fired INTEGER DEFAULT 0,
             sent INTEGER DEFAULT 0,
             created_at INTEGER NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS habits (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            date TEXT NOT NULL,
-            UNIQUE(name, date)
         );
 
         CREATE TABLE IF NOT EXISTS state (
@@ -296,56 +289,6 @@ def get_pending_reminders():
     return [dict(r) for r in rows]
 
 
-# ── habits ──
-def mark_habit(name):
-    today = datetime.now().strftime("%Y-%m-%d")
-    c = db()
-    try:
-        cur = c.execute("INSERT INTO habits(name,date) VALUES(?,?)", (name, today))
-        c.commit()
-        hid = cur.lastrowid
-        rows = c.execute(
-            "SELECT date FROM habits WHERE name=? ORDER BY date DESC", (name,)
-        ).fetchall()
-        streak = 0
-        d = datetime.now().date()
-        for r in rows:
-            if datetime.strptime(r["date"], "%Y-%m-%d").date() == d:
-                streak += 1
-                d -= timedelta(days=1)
-            else:
-                break
-        c.close()
-        return streak, hid
-    except sqlite3.IntegrityError:
-        c.close()
-        return 0, None
-
-
-def get_habits_today():
-    today = datetime.now().strftime("%Y-%m-%d")
-    out = {}
-    c = db()
-    for habit in ["тренировка", "чтение", "вода", "подъём"]:
-        done = c.execute(
-            "SELECT 1 FROM habits WHERE name=? AND date=?", (habit, today)
-        ).fetchone() is not None
-        rows = c.execute(
-            "SELECT date FROM habits WHERE name=? ORDER BY date DESC", (habit,)
-        ).fetchall()
-        streak = 0
-        d = datetime.now().date()
-        for r in rows:
-            if datetime.strptime(r["date"], "%Y-%m-%d").date() == d:
-                streak += 1
-                d -= timedelta(days=1)
-            else:
-                break
-        out[habit] = (done, streak)
-    c.close()
-    return out
-
-
 # ── undo ──
 def push_undo(kind, local_id, chat_id):
     c = db()
@@ -502,18 +445,6 @@ async def sync_idea_to_notion(iid: int, category: str, text: str):
         log.info("notion ✓ %s #%s → %s", local_type, iid, page_id[:8])
 
 
-async def sync_habit_to_notion(hid: int, name: str):
-    if not hid or not NOTION_DB_HABITS:
-        return
-    page_id = await notion_create(NOTION_DB_HABITS, {
-        "Name": _title(name),
-        "Date": _date(datetime.now()),
-    })
-    if page_id:
-        save_notion_map("habit", hid, page_id)
-        log.info("notion ✓ habit #%s → %s", hid, page_id[:8])
-
-
 async def sync_done_to_notion(local_type: str, local_id: int):
     page_id = get_notion_page(local_type, local_id)
     if page_id:
@@ -610,35 +541,44 @@ async def transcribe_voice(file_bytes: bytes) -> Optional[str]:
 
 
 # ═══════════════════════ LLM Classifier ═══════════════════════
-LLM_SYSTEM_PROMPT = """Ты — классификатор сообщений для продуктового бота Абылая (владелец STK парфюмерии в Алматы и проекта CLOQ — часы).
+LLM_SYSTEM_PROMPT = """Ты — классификатор сообщений для личного Telegram-бота Абылая (владелец STK парфюмерии в Алматы и проекта CLOQ — часы).
 
 Верни ТОЛЬКО валидный JSON (без ```, без комментариев, без объяснений):
 {
-  "type": "task_stk" | "task_cloq" | "idea_business" | "idea_marketing" | "personal" | "habit" | "question",
+  "type": "task_stk" | "task_cloq" | "idea_business" | "idea_marketing" | "personal" | "question",
   "priority": "urgent" | "important" | "strategic",
-  "habit_name": "тренировка" | "чтение" | "вода" | "подъём",
   "text": "очищенный текст"
 }
 
+ГЛАВНОЕ ПРАВИЛО: всё что не относится явно к STK или CLOQ — это "personal".
+
 Правила:
-- "task_stk" — действие по парфюмерному бизнесу (менеджеры, склад, сайт, Kaspi, реклама STK)
-- "task_cloq" — действие по часовому бизнесу
-- "idea_business" — мысль/гипотеза для бизнеса (не действие)
-- "idea_marketing" — креативная / рекламная идея
-- "personal" — личные дела (купить, забрать, к врачу, встреча)
-- "habit" — отметка выполненной привычки (явно: "сделал", "прошёл", "выпил", "прочитал")
-- "question" — вопрос, требующий ответа
+- "task_stk" — действие ПО парфюмерному бизнесу STK (менеджеры, склад, сайт STK, Kaspi, реклама STK, аромат, флаконы). Явная связь с STK обязательна.
+- "task_cloq" — действие ПО часовому бизнесу CLOQ. Явная связь обязательна.
+- "idea_business" — ЯВНАЯ бизнес-гипотеза/мысль про STK или CLOQ ("а что если", "гипотеза", "концепция нового продукта"). НЕ для бытовых "хорошо бы".
+- "idea_marketing" — креативная/рекламная идея, явно про рекламу STK или CLOQ (креатив, ролик, кампания, сторителлинг).
+- "personal" — ВСЁ ОСТАЛЬНОЕ: тренировки, здоровье, покупки, встречи, бытовые дела, семья, друзья, путешествия, хобби, личные планы, саморазвитие, обучение.
+- "question" — вопрос, требующий ответа (начинается с ?, "как", "что думаешь", "посоветуй").
 
 Приоритет для task_*: urgent (горит сегодня-завтра), important (важно на неделе), strategic (долгосрочное).
 
 Примеры:
 "закупить флаконы 50мл" → {"type":"task_stk","priority":"urgent","text":"закупить флаконы 50мл"}
 "обновить дизайн для CLOQ" → {"type":"task_cloq","priority":"important","text":"обновить дизайн"}
-"может запустим подкаст про парфюм" → {"type":"idea_business","text":"запустить подкаст про парфюм"}
-"крутая идея — до/после аромат в рекламе" → {"type":"idea_marketing","text":"реклама до/после по аромату"}
+"а что если запустить подкаст для клиентов STK" → {"type":"idea_business","text":"запустить подкаст для STK"}
+"креатив для CLOQ — часы как семейная реликвия" → {"type":"idea_marketing","text":"CLOQ: часы как семейная реликвия"}
 "купить молоко по пути" → {"type":"personal","text":"купить молоко"}
-"сходил на тренировку" → {"type":"habit","habit_name":"тренировка","text":""}
-"какая маржа на 50мл" → {"type":"question","text":"какая маржа на 50мл"}"""
+"сходить на тренировку завтра" → {"type":"personal","text":"тренировка завтра"}
+"почитать книгу про продажи" → {"type":"personal","text":"прочитать книгу про продажи"}
+"записаться к стоматологу" → {"type":"personal","text":"записаться к стоматологу"}
+"позвонить маме" → {"type":"personal","text":"позвонить маме"}
+"отфоткать гардероб и подобрать образы" → {"type":"personal","text":"отфоткать гардероб и подобрать образы"}
+"выбрать костюм на свадьбу" → {"type":"personal","text":"выбрать костюм на свадьбу"}
+"сходить в кино" → {"type":"personal","text":"сходить в кино"}
+"провести анализ конкурентов STK" → {"type":"task_stk","priority":"important","text":"анализ конкурентов"}
+"какая маржа на 50мл" → {"type":"question","text":"какая маржа на 50мл"}
+
+Если сомневаешься — выбирай "personal"."""
 
 
 async def llm_classify(text: str) -> Optional[dict]:
@@ -721,85 +661,6 @@ def get_weather():
         return "🌡 Погода недоступна"
 
 
-# ═══════════════════════ Business Terms ═══════════════════════
-BUSINESS_TERMS = [
-    {"term": "Cash Flow", "tr": "/kæʃ floʊ/", "ru": "Денежный поток",
-     "ex": "Positive cash flow = больше пришло чем потратили.",
-     "tip": "Cash flow ≠ profit! Можно быть прибыльным, но без денег."},
-    {"term": "Unit Economics", "tr": "/ˈjuːnɪt ˌekəˈnɒmɪks/", "ru": "Юнит-экономика",
-     "ex": "Цена − все расходы = прибыль с одной продажи.",
-     "tip": "Если отрицательная — каждая продажа делает беднее."},
-    {"term": "CAC", "tr": "/siː eɪ siː/", "ru": "Стоимость привлечения клиента",
-     "ex": "$1000 на FB → 10 клиентов = CAC $100.",
-     "tip": "Здоровый CAC < 1/3 от LTV."},
-    {"term": "LTV", "tr": "/el tiː viː/", "ru": "Пожизненная ценность клиента",
-     "ex": "Клиент покупает 3 раза по 42 580 = LTV 127 740 тг.",
-     "tip": "LTV / CAC = 3+ — здоровый бизнес."},
-    {"term": "Burn Rate", "tr": "/bɜːrn reɪt/", "ru": "Скорость сжигания денег",
-     "ex": "Burn rate $50K/месяц = тратите 50 тысяч каждый месяц.",
-     "tip": "Burn rate × 12 = сколько нужно на год."},
-    {"term": "Runway", "tr": "/ˈrʌnweɪ/", "ru": "Запас денег",
-     "ex": "$300K / $50K burn = 6 месяцев runway.",
-     "tip": "Меньше 6 месяцев — пора искать инвестиции или резать расходы."},
-    {"term": "Gross Margin", "tr": "/ɡroʊs ˈmɑːrdʒɪn/", "ru": "Валовая маржа",
-     "ex": "Цена − себестоимость = 88% gross margin.",
-     "tip": "> 70% — отличный товарный бизнес."},
-    {"term": "ROI", "tr": "/ɑːr oʊ aɪ/", "ru": "Возврат инвестиций",
-     "ex": "Вложил $1, получил $3 → ROI 200%.",
-     "tip": "ROI < 100% — инвестиция не окупается."},
-    {"term": "Pipeline", "tr": "/ˈpaɪplaɪn/", "ru": "Воронка сделок",
-     "ex": "В пайплайне 50 лидов на разных стадиях.",
-     "tip": "Healthy pipeline = 3-4× от месячной цели."},
-    {"term": "Conversion Rate", "tr": "/kənˈvɜːrʃən reɪt/", "ru": "Конверсия",
-     "ex": "1000 посетителей → 30 заявок = 3% CR.",
-     "tip": "Хорошая CR для лендинга = 2-5%."},
-    {"term": "Churn Rate", "tr": "/tʃɜːrn reɪt/", "ru": "Отток клиентов",
-     "ex": "Из 100 клиентов 5 ушли = 5% monthly churn.",
-     "tip": "Снижай churn в первую очередь."},
-    {"term": "ARPU", "tr": "/ˈɑːrpuː/", "ru": "Средний доход на клиента",
-     "ex": "17.5М / 412 клиентов = ARPU 42 500 тг.",
-     "tip": "Растёт ARPU — растёт бизнес без новых клиентов."},
-    {"term": "MRR / ARR", "tr": "/em ɑːr ɑːr/", "ru": "Месячная/годовая регулярная выручка",
-     "ex": "100 клиентов × 5000/мес = MRR 500K.",
-     "tip": "Инвесторы оценивают компании по ARR."},
-    {"term": "Pivot", "tr": "/ˈpɪvət/", "ru": "Резкая смена стратегии",
-     "ex": "Slack начинался как игра → пивот в мессенджер.",
-     "tip": "Pivot — не провал. Failure to pivot — провал."},
-    {"term": "Bootstrap", "tr": "/ˈbuːtstræp/", "ru": "Развиваться без внешних денег",
-     "ex": "Mailchimp bootstrap до $700M.",
-     "tip": "Подходит когда unit economics уже работает."},
-    {"term": "Scale", "tr": "/skeɪl/", "ru": "Масштабирование",
-     "ex": "Программу пишут 1 раз, продают 1000 раз.",
-     "tip": "Сначала PMF, потом scale."},
-    {"term": "PMF (Product-Market Fit)", "tr": "/piː em ef/", "ru": "Соответствие продукт-рынок",
-     "ex": "40%+ клиентов скажут «расстроюсь без вас» — у тебя PMF.",
-     "tip": "До PMF — итерируй. После — масштабируй."},
-    {"term": "Funnel", "tr": "/ˈfʌnəl/", "ru": "Воронка",
-     "ex": "1000 видели → 100 кликнули → 30 заявок → 10 оплат.",
-     "tip": "Найди узкое место и расшивай его."},
-    {"term": "B2B / B2C / D2C", "tr": "/biː tuː biː/", "ru": "Бизнес-модели",
-     "ex": "STK = D2C — продаёте напрямую через рекламу.",
-     "tip": "D2C = выше маржа, нужны свои каналы."},
-    {"term": "Cohort Analysis", "tr": "/ˈkoʊhɔːrt/", "ru": "Анализ когорт",
-     "ex": "Январь — 30% повторных. Февраль — 40%. Тренд растёт.",
-     "tip": "Без когорт — ты гадаешь."},
-    {"term": "NPS", "tr": "/en piː es/", "ru": "Индекс лояльности",
-     "ex": "70% промоутеров − 10% детракторов = NPS 60.",
-     "tip": "NPS > 50 — отлично. < 0 — проблема."},
-    {"term": "Stakeholder", "tr": "/ˈsteɪkhoʊldər/", "ru": "Заинтересованная сторона",
-     "ex": "Перед изменениями — обсуди со stakeholders.",
-     "tip": "Управляй ими как картой."},
-    {"term": "Bandwidth", "tr": "/ˈbændwɪdθ/", "ru": "Свободное время / ресурсы",
-     "ex": "I don't have bandwidth = у меня нет времени.",
-     "tip": "Делегируй пока не достиг bandwidth."},
-    {"term": "Headcount", "tr": "/ˈhedkaʊnt/", "ru": "Количество сотрудников",
-     "ex": "Need to grow headcount by 20% next quarter.",
-     "tip": "Headcount × ЗП = большая часть burn rate."},
-    {"term": "AOV (Average Order Value)", "tr": "/eɪ oʊ viː/", "ru": "Средний чек",
-     "ex": "Выручка / число заказов = AOV.",
-     "tip": "Подними AOV upsell'ом — легче чем привлечь нового."},
-]
-
 
 # ═══════════════════════ Regex classifier ═══════════════════════
 TASK_PREFIX = re.compile(r"^(задача|таск|todo|сделать)[:\s]+(.+)", re.IGNORECASE)
@@ -809,20 +670,35 @@ IDEA_PREFIX = re.compile(r"^идея[:\s]+(.+)", re.IGNORECASE)
 MARKETING_PREFIX = re.compile(r"^(маркетинг|реклама|креатив)[:\s]+(.+)", re.IGNORECASE)
 CLOQ_PREFIX = re.compile(r"^(cloq|клок)[:\s]+(.+)", re.IGNORECASE)
 PERSONAL_PREFIX = re.compile(r"^(личн\w+|personal)[:\s]+(.+)", re.IGNORECASE)
-PERSONAL_WORDS = ["купить", "купи ", "встреча", "посылк", "ремонт", "забрать",
-                  "врач", "стрижк", "спортзал", "магазин"]
-HABIT_WORDS = {
-    "тренировка": ["тренировк", "зал ", "спорт", "gym", "жаттығу"],
-    "чтение":     ["чтени", "книг", "read", "оқу"],
-    "вода":       ["вода 2", "вода ✅", "water", "су 2"],
-    "подъём":     ["подъём", "ранний подъ", "ерте тұрдым"],
-}
+PERSONAL_WORDS = [
+    # покупки и дом
+    "купить", "купи ", "заказать", "магазин", "посылк", "ремонт", "забрать",
+    "починить", "убрать", "постирать",
+    # здоровье
+    "врач", "доктор", "больниц", "таблетк", "аптек", "стоматолог",
+    # спорт и тренировки
+    "тренировк", "тренажёр", "тренажер", "зал ", "спорт", "пробежк", "бассейн",
+    "йога", "йогу", "массаж", "gym",
+    # встречи и личное
+    "встреча", "встретит", "позвонить", "написать друг", "написать жене",
+    "стрижк", "парикмахер", "маникюр",
+    # быт/путешествия
+    "спортзал", "такси", "билет", "паспорт", "виза",
+    # стиль / одежда / внешность
+    "гардероб", "одежд", "образ ", "образы", "обув", "стиль", "шопинг",
+    "костюм", "джинс", "рубашк", "брюки", "пальто", "отфоткат", "отфаткат",
+    # досуг / еда
+    "кафе", "ресторан", "кино", "концерт", "вечеринк", "погулят", "прогулк",
+    "отдых", "выходн", "отпуск", "поездк",
+    # семья / общение
+    "мам", "пап", "жен", "ребёнк", "ребенк", "сын", "дочь", "друг",
+]
 
 
 def parse_time(text: str):
     now = datetime.now()
     tomorrow = now + timedelta(days=1)
-    early = any(w in text.lower() for w in ["тренировк", "спорт", "зал ", "gym"])
+    early = False  # раньше был флаг для тренировок — больше не используется
 
     m = re.search(r"завтра\s+в\s+(\d{1,2})(?::(\d{2}))?", text, re.IGNORECASE)
     if m:
@@ -859,12 +735,6 @@ def parse_time(text: str):
 def classify_regex(text: str):
     t = text.strip()
     low = t.lower()
-
-    if "✅" in t or low.endswith(" ок") or low.endswith(" done"):
-        clean = t.replace("✅", "").strip().rstrip(" ок").rstrip(" done")
-        for habit, kws in HABIT_WORDS.items():
-            if any(w in clean.lower() for w in kws):
-                return {"type": "habit", "name": habit}
 
     parsed = parse_time(t)
     if parsed:
@@ -914,8 +784,6 @@ def classify_regex(text: str):
         return {"type": "cmd_digest"}
     if low in ("все", "всё", "все задачи", "всё задачи", "all", "полный список"):
         return {"type": "cmd_all"}
-    if low in ("привычки", "habits", "трекер"):
-        return {"type": "cmd_habits"}
     if low in ("погода", "weather"):
         return {"type": "cmd_weather"}
     if low in ("синк", "sync", "синхронизация"):
@@ -929,14 +797,14 @@ def classify_regex(text: str):
 
 
 async def classify(text: str) -> dict:
-    """Regex → LLM fallback → default idea."""
+    """Regex → LLM fallback → default personal."""
     res = classify_regex(text)
     if res is not None:
         return res
 
     llm = await llm_classify(text)
     if llm:
-        kind = llm.get("type", "idea_business")
+        kind = llm.get("type", "personal")
         body = (llm.get("text") or text).strip()
         if kind == "task_stk":
             return {"type": "task", "project": "stk", "priority": llm.get("priority", "urgent"), "text": body}
@@ -948,15 +816,11 @@ async def classify(text: str) -> dict:
             return {"type": "idea", "category": "marketing", "text": body}
         if kind == "personal":
             return {"type": "personal", "text": body}
-        if kind == "habit":
-            hname = llm.get("habit_name", "тренировка")
-            if hname not in HABIT_WORDS:
-                hname = "тренировка"
-            return {"type": "habit", "name": hname}
         if kind == "question":
             return {"type": "ask", "text": body}
 
-    return {"type": "idea", "category": "business", "text": text}
+    # Если ни regex ни LLM не разобрались — по умолчанию ЛИЧНОЕ
+    return {"type": "personal", "text": text}
 
 
 # ═══════════════════════ Reminder scheduling ═══════════════════════
@@ -1003,7 +867,7 @@ def rehydrate_reminders(job_queue):
         if dt <= now:
             mark_reminder_sent(r["id"])  # просроченные просто закрываем
             continue
-        early = (r["kind"] == "early") or ("тренировк" in r["text"].lower())
+        early = r["kind"] == "early"
         schedule_reminder_jobs(
             job_queue, r["id"], r["text"], dt, r["chat_id"],
             early=early, early_fired_already=bool(r["early_fired"]),
@@ -1094,20 +958,6 @@ def build_digest():
             msg += f"   ☐ {r['text'][:45]}{age}\n"
             tasks_for_buttons.append((f"done:personal:{r['id']}", r["text"]))
 
-    msg += "\n━━━━━ 🔥 *ПРИВЫЧКИ* ━━━━━\n"
-    icons = {"тренировка": "🏋", "чтение": "📖", "вода": "💧", "подъём": "🌅"}
-    for name, (done, streak) in get_habits_today().items():
-        fire = "🔥" * min(streak, 5) if streak >= 2 else ""
-        msg += f"   {icons[name]} {'✅' if done else '☐'} {name} · {streak} дн {fire}\n"
-
-    day_idx = now.timetuple().tm_yday % len(BUSINESS_TERMS)
-    term = BUSINESS_TERMS[day_idx]
-    msg += "\n━━━━━ 🇬🇧 *БИЗНЕС-ТЕРМИН* ━━━━━\n"
-    msg += f"\n*{term['term']}* {term['tr']}\n"
-    msg += f"📖 _{term['ru']}_\n\n"
-    msg += f"💬 {term['ex']}\n\n"
-    msg += f"💡 {term['tip']}"
-
     # Кнопка на каждой задаче (2 колонки, до 20 штук)
     visible = tasks_for_buttons[:20]
     if len(tasks_for_buttons) > 20:
@@ -1177,12 +1027,7 @@ def build_weekly_report():
     msg += f"🌹 STK закрыто: *{closed_stk}*\n"
     msg += f"⌚ CLOQ закрыто: *{closed_cloq}*\n"
     msg += f"💡 Новых идей: *{new_ideas}*\n"
-    msg += f"📋 Открыто всего: *{open_total}*\n\n"
-    msg += "🔥 *Привычки (streak):*\n"
-    icons = {"тренировка": "🏋", "чтение": "📖", "вода": "💧", "подъём": "🌅"}
-    for name, (_, streak) in get_habits_today().items():
-        fire = "🔥" * min(streak, 5) if streak >= 2 else ""
-        msg += f"   {icons[name]} {name}: *{streak}* дн {fire}\n"
+    msg += f"📋 Открыто всего: *{open_total}*\n"
     return msg
 
 
@@ -1206,14 +1051,6 @@ async def process_text(text: str, update: Update, context: ContextTypes.DEFAULT_
         chunks = build_full_open_list()
         for text, kb in chunks:
             await reply(text, parse_mode="Markdown", reply_markup=kb)
-
-    elif t == "cmd_habits":
-        msg = "🔥 *Привычки сегодня:*\n\n"
-        icons = {"тренировка": "🏋", "чтение": "📖", "вода": "💧", "подъём": "🌅"}
-        for name, (done, streak) in get_habits_today().items():
-            fire = "🔥" * min(streak, 5) if streak >= 2 else ""
-            msg += f"{icons[name]} {'✅' if done else '☐'} {name} · {streak} дн {fire}\n"
-        await reply(msg, parse_mode="Markdown")
 
     elif t == "cmd_weather":
         await reply(get_weather())
@@ -1244,24 +1081,6 @@ async def process_text(text: str, update: Update, context: ContextTypes.DEFAULT_
                 asyncio.create_task(sync_archive_to_notion(nt, lid))
             await reply(f"↩️ Запись #{lid} отменена")
 
-    elif t == "habit":
-        streak, hid = mark_habit(res["name"])
-        if streak == 0:
-            await reply(f"✅ {res['name']} — уже отмечено сегодня!")
-        else:
-            if NOTION_ENABLED and NOTION_DB_HABITS:
-                asyncio.create_task(sync_habit_to_notion(hid, res["name"]))
-            fire = "🔥" * min(streak, 5)
-            extra = ""
-            if streak >= 7:
-                extra = "\n\n🎉 *НЕДЕЛЯ ПОДРЯД!*"
-            elif streak >= 3:
-                extra = "\n\n💪 Так держать!"
-            await reply(
-                f"✅ *{res['name']}* отмечено!\n\n📊 Серия: *{streak} дней* {fire}{extra}",
-                parse_mode="Markdown",
-            )
-
     elif t == "task":
         tid = add_task(res["project"], res["priority"], res["text"])
         push_undo("task", tid, chat_id)
@@ -1271,7 +1090,8 @@ async def process_text(text: str, update: Update, context: ContextTypes.DEFAULT_
         proj = "STK" if res["project"] == "stk" else "CLOQ"
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton("✅ Готово", callback_data=f"done:task:{tid}"),
-            InlineKeyboardButton("❌ Удалить", callback_data=f"del:task:{tid}"),
+            InlineKeyboardButton("🔄", callback_data=f"move:task:{tid}"),
+            InlineKeyboardButton("❌", callback_data=f"del:task:{tid}"),
         ]])
         await reply(
             f"{icons.get(res['priority'], '🔴')} *{proj} — Задача:*\n\n☐ {res['text']}",
@@ -1285,7 +1105,10 @@ async def process_text(text: str, update: Update, context: ContextTypes.DEFAULT_
         if NOTION_ENABLED:
             asyncio.create_task(sync_idea_to_notion(iid, res["category"], res["text"]))
         labels = {"business": "💡 Бизнес-идея", "marketing": "🎯 Маркетинг"}
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Удалить", callback_data=f"del:idea:{iid}")]])
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔄 Переместить", callback_data=f"move:idea:{iid}"),
+            InlineKeyboardButton("❌ Удалить", callback_data=f"del:idea:{iid}"),
+        ]])
         await reply(
             f"{labels.get(res['category'], '💡')}:\n\n☐ {res['text']}",
             reply_markup=kb,
@@ -1298,7 +1121,8 @@ async def process_text(text: str, update: Update, context: ContextTypes.DEFAULT_
             asyncio.create_task(sync_idea_to_notion(iid, "personal", res["text"]))
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton("✅ Готово", callback_data=f"done:personal:{iid}"),
-            InlineKeyboardButton("❌ Удалить", callback_data=f"del:personal:{iid}"),
+            InlineKeyboardButton("🔄", callback_data=f"move:personal:{iid}"),
+            InlineKeyboardButton("❌", callback_data=f"del:personal:{iid}"),
         ]])
         await reply(
             f"🏃 *Личное:*\n\n☐ {res['text']}",
@@ -1398,6 +1222,73 @@ async def _edit_done(q):
         pass
 
 
+async def _recategorize(source_kind: str, source_id: int,
+                        target_kind: str,
+                        target_project: Optional[str] = None,
+                        target_priority: str = "urgent",
+                        target_category: str = "business") -> Optional[tuple]:
+    """Переносит запись из одной категории в другую.
+
+    source_kind: 'task' | 'idea' | 'personal'
+    target_kind: 'task' | 'idea' | 'personal'
+    Возвращает (new_id, text) или None при ошибке.
+    """
+    c = db()
+    # Читаем старую запись
+    if source_kind == "task":
+        row = c.execute("SELECT text, created_at FROM tasks WHERE id=?", (source_id,)).fetchone()
+    else:
+        row = c.execute("SELECT text, created_at FROM ideas WHERE id=?", (source_id,)).fetchone()
+    if not row:
+        c.close()
+        return None
+    text = row["text"]
+    created_at = row["created_at"]
+    c.close()
+
+    # Архивируем в Notion (если был синк)
+    if NOTION_ENABLED:
+        map_kind = "personal" if source_kind == "personal" else ("task" if source_kind == "task" else "idea")
+        try:
+            await sync_archive_to_notion(map_kind, source_id)
+        except Exception as e:
+            log.warning("recategorize: archive failed: %s", e)
+
+    # Удаляем локально
+    if source_kind == "task":
+        delete_task_local(source_id)
+    else:
+        delete_idea_local(source_id)
+
+    # Создаём новую запись
+    if target_kind == "task":
+        new_id = add_task(target_project or "stk", target_priority, text)
+        # Подменим created_at чтобы сохранить возраст
+        c = db()
+        c.execute("UPDATE tasks SET created_at=? WHERE id=?", (created_at, new_id))
+        c.commit(); c.close()
+        if NOTION_ENABLED:
+            asyncio.create_task(sync_task_to_notion(new_id, target_project or "stk", target_priority, text))
+        return new_id, text
+    elif target_kind == "idea":
+        new_id = add_idea(target_category, text)
+        c = db()
+        c.execute("UPDATE ideas SET created_at=? WHERE id=?", (created_at, new_id))
+        c.commit(); c.close()
+        if NOTION_ENABLED:
+            asyncio.create_task(sync_idea_to_notion(new_id, target_category, text))
+        return new_id, text
+    elif target_kind == "personal":
+        new_id = add_idea("personal", text)
+        c = db()
+        c.execute("UPDATE ideas SET created_at=? WHERE id=?", (created_at, new_id))
+        c.commit(); c.close()
+        if NOTION_ENABLED:
+            asyncio.create_task(sync_idea_to_notion(new_id, "personal", text))
+        return new_id, text
+    return None
+
+
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -1443,6 +1334,79 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text((q.message.text or "") + "\n\n❌ Удалено")
         except Exception:
             pass
+    elif action == "move":
+        # Показываем меню куда переместить. kind = 'task' | 'idea' | 'personal'
+        rows = []
+        if kind != "personal":
+            rows.append([InlineKeyboardButton("🏃 В Личное", callback_data=f"to:{kind}-personal:{lid}")])
+        if kind != "task":
+            rows.append([
+                InlineKeyboardButton("🔴 STK срочно", callback_data=f"to:{kind}-stk-urgent:{lid}"),
+                InlineKeyboardButton("🟡 STK важно", callback_data=f"to:{kind}-stk-important:{lid}"),
+            ])
+            rows.append([InlineKeyboardButton("⌚ CLOQ", callback_data=f"to:{kind}-cloq-urgent:{lid}")])
+        if kind != "idea":
+            rows.append([
+                InlineKeyboardButton("💡 Бизнес-идея", callback_data=f"to:{kind}-idea-business:{lid}"),
+                InlineKeyboardButton("🎯 Маркетинг", callback_data=f"to:{kind}-idea-marketing:{lid}"),
+            ])
+        rows.append([InlineKeyboardButton("⬅️ Отмена", callback_data=f"cancel:{kind}:{lid}")])
+        try:
+            await q.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(rows))
+        except Exception:
+            pass
+    elif action == "to":
+        # kind формата 'source-target' или 'source-stk-urgent'
+        parts2 = kind.split("-")
+        source = parts2[0]
+        if parts2[1] == "personal":
+            target_kind, tproj, tpri, tcat = "personal", None, "urgent", "personal"
+            label = "🏃 Личное"
+        elif parts2[1] == "stk":
+            target_kind, tproj, tpri, tcat = "task", "stk", parts2[2] if len(parts2) > 2 else "urgent", ""
+            label = f"🌹 STK ({tpri})"
+        elif parts2[1] == "cloq":
+            target_kind, tproj, tpri, tcat = "task", "cloq", parts2[2] if len(parts2) > 2 else "urgent", ""
+            label = "⌚ CLOQ"
+        elif parts2[1] == "idea":
+            target_kind, tproj, tpri, tcat = "idea", None, "urgent", parts2[2] if len(parts2) > 2 else "business"
+            label = f"💡 {'Маркетинг' if tcat == 'marketing' else 'Бизнес-идея'}"
+        else:
+            return
+        res = await _recategorize(source, lid, target_kind, tproj, tpri, tcat)
+        if res:
+            try:
+                new_text = (q.message.text or "").split("\n\n")[-1]
+                await q.edit_message_text(
+                    text=f"✅ Перемещено → {label}\n\n☐ {new_text[:200]}",
+                )
+            except Exception:
+                await q.answer(f"✅ → {label}")
+        else:
+            await q.answer("⚠️ Не удалось переместить")
+    elif action == "cancel":
+        # Вернуть обычные кнопки для записи
+        try:
+            if kind == "task":
+                kb = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ Готово", callback_data=f"done:task:{lid}"),
+                    InlineKeyboardButton("🔄 Переместить", callback_data=f"move:task:{lid}"),
+                    InlineKeyboardButton("❌ Удалить", callback_data=f"del:task:{lid}"),
+                ]])
+            elif kind == "personal":
+                kb = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ Готово", callback_data=f"done:personal:{lid}"),
+                    InlineKeyboardButton("🔄 Переместить", callback_data=f"move:personal:{lid}"),
+                    InlineKeyboardButton("❌ Удалить", callback_data=f"del:personal:{lid}"),
+                ]])
+            else:  # idea
+                kb = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔄 Переместить", callback_data=f"move:idea:{lid}"),
+                    InlineKeyboardButton("❌ Удалить", callback_data=f"del:idea:{lid}"),
+                ]])
+            await q.edit_message_reply_markup(reply_markup=kb)
+        except Exception:
+            pass
 
 
 # ═══════════════════════ Commands ═══════════════════════
@@ -1450,21 +1414,23 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 *STK Bot v2 — Notion edition*\n\n"
         "Пиши задачи, идеи, напоминания. Голосовые 🎤 тоже работают.\n\n"
-        "*Быстрые команды:*\n"
-        "• `задачи` — утренний дайджест\n"
-        "• `все` — полный список с чекбоксами ☑️\n"
-        "• `привычки` · `погода`\n"
-        "• `синк` — подтянуть изменения из Notion\n"
-        "• `отмена` — откатить последнее добавление\n\n"
-        "*Примеры ввода:*\n"
+        "*Правило:* всё что не про STK или CLOQ — падает в 🏃 Личное.\n\n"
+        "*Префиксы для бизнеса:*\n"
         "• `задача: исправить цену` → 🔴 STK\n"
         "• `важно: добавить товары` → 🟡 STK\n"
         "• `стратегия: выход на Узбекистан` → 🟢 STK\n"
         "• `cloq: новый дизайн` → ⌚ CLOQ\n"
         "• `маркетинг: до/после креатив` → 🎯\n"
-        "• `личное: забрать костюм`\n"
-        "• `тренировка завтра в 7` → ⏰ + за час\n"
-        "• `тренировка ✅` → 🔥 streak\n"
+        "• `идея: подкаст для клиентов` → 💡\n\n"
+        "*Всё остальное = личное:*\n"
+        "• `тренировка завтра в 7` → ⏰ напоминание\n"
+        "• `купить молоко` → 🏃 личное\n"
+        "• `записаться к стоматологу` → 🏃\n"
+        "• `позвонить маме` → 🏃\n\n"
+        "*Быстрые команды:*\n"
+        "• `задачи` — утренний дайджест\n"
+        "• `все` — полный список с чекбоксами ☑️\n"
+        "• `погода` · `синк` · `отмена`\n"
         "• `?какая маржа на 50мл` → 💬 AI",
         parse_mode="Markdown",
     )
@@ -1579,7 +1545,7 @@ async def run():
         days=(6,), name="weekly_report",
     )
 
-    log.info("🤖 STK Bot v2 starting")
+    log.info("🤖 STK Bot v2.3 starting — NO habits, NO business terms, move-button, personal-default")
     log.info("   OWNER=%s  NOTION=%s  VOICE=%s  LLM_CLS=%s  CITY=%s",
              OWNER_ID,
              "ON" if NOTION_ENABLED else "OFF",
