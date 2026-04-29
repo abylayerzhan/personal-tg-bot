@@ -639,6 +639,47 @@ async def ask_claude(question: str) -> str:
         return f"⚠️ Ошибка AI: {e}"
 
 
+async def claude_check_answer(lesson: str, user_answer: str) -> str:
+    if not ANTHROPIC_KEY:
+        return "AI выключен (ANTHROPIC_API_KEY не задан)"
+    try:
+        from anthropic import AsyncAnthropic
+        client = AsyncAnthropic(api_key=ANTHROPIC_KEY)
+        msg = await client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=2000,
+            system=(
+                "Ты — строгий и добрый преподаватель английского для носителя русского языка уровня B1+.\n"
+                "Тебе дают задание урока и ответ ученика. Дай детальный разбор строго в 7 секциях, "
+                "без вступлений и заключений вне секций:\n\n"
+                "📊 ОЦЕНКА — одна строка: уровень исполнения, общий балл /10, одно предложение-вывод.\n\n"
+                "✅ ЧТО СИЛЬНО — 2–4 пункта что сделано хорошо. "
+                "Цитируй фразы ученика в «кавычках» чтобы он видел конкретно.\n\n"
+                "🔍 ПОФРАЗОВЫЙ РАЗБОР — разбери каждое предложение ученика:\n"
+                "  • оригинал\n"
+                "  • ✓ ок  (или исправленный вариант)\n"
+                "  • одна строка комментария\n\n"
+                "❌ ОШИБКИ И ПРАВИЛА — для каждой ошибки:\n"
+                "  ❌ написал → ✅ надо\n"
+                "  📌 Правило: одно предложение\n"
+                "  💡 Пример: живой пример из речи\n\n"
+                "🚀 КАК СКАЗАЛ БЫ B2 — перепиши весь ответ ученика целиком на уровне B2: "
+                "богаче лексика, точнее структуры, без русизмов.\n\n"
+                "🎯 МИНИ-УПРАЖНЕНИЕ — одно конкретное задание на самую частую ошибку из этого ответа.\n\n"
+                "💪 ИТОГ — 2 строки: что прокачать к следующему уроку.\n\n"
+                "Пиши по-русски. Каждую секцию начинай с её заголовка."
+            ),
+            messages=[{
+                "role": "user",
+                "content": f"Задание урока: {lesson}\n\nОтвет ученика:\n{user_answer}",
+            }],
+        )
+        return msg.content[0].text
+    except Exception as e:
+        log.error("claude_check_answer error: %s", e)
+        return f"⚠️ Ошибка AI: {e}"
+
+
 # ═══════════════════════ Weather ═══════════════════════
 def get_weather():
     try:
@@ -792,6 +833,10 @@ def classify_regex(text: str):
         return {"type": "cmd_undo"}
     if low.startswith(("?", "вопрос:")) and ANTHROPIC_KEY:
         return {"type": "ask", "text": re.sub(r"^[?]\s*|вопрос:\s*", "", t, flags=re.IGNORECASE)}
+
+    m = re.match(r"^урок[:\s]+(.+)", t, re.IGNORECASE | re.DOTALL)
+    if m:
+        return {"type": "english_lesson_start", "prompt": m.group(1).strip()}
 
     return None  # неизвестно — упадёт в LLM
 
@@ -1032,16 +1077,51 @@ def build_weekly_report():
 
 
 # ═══════════════════════ Core processing ═══════════════════════
+async def _send_long(reply_fn, text: str, parse_mode: str = "Markdown"):
+    """Отправляет текст одним сообщением или режет по \\n\\n если >3900 символов."""
+    if len(text) <= 3900:
+        await reply_fn(text, parse_mode=parse_mode)
+        return
+    chunks: list[str] = []
+    current = ""
+    for para in text.split("\n\n"):
+        candidate = (current + "\n\n" + para).lstrip("\n") if current else para
+        if len(candidate) > 3900:
+            if current:
+                chunks.append(current)
+            current = para
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    total = len(chunks)
+    for i, chunk in enumerate(chunks, 1):
+        suffix = f"\n\n_(часть {i}/{total})_" if total > 1 else ""
+        await reply_fn(chunk + suffix, parse_mode=parse_mode)
+
+
 async def process_text(text: str, update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_state("last_chat_id", update.effective_chat.id)
     log.info("MSG: %s", text[:100])
-    res = await classify(text)
-    log.info("CLS: %s", res.get("type"))
-    t = res["type"]
     chat_id = update.effective_chat.id
 
     async def reply(*a, **kw):
         return await update.effective_message.reply_text(*a, **kw)
+
+    # Если есть активный урок — любой текст (кроме нового урока и отмены) считается ответом ученика
+    pending_lesson = get_state("pending_english_lesson", "")
+    if pending_lesson and not re.match(r"^урок[:\s]", text, re.IGNORECASE) and text.lower() not in ("отмена", "стоп", "cancel"):
+        await update.effective_chat.send_action("typing")
+        set_state("pending_english_lesson", "")
+        feedback = await claude_check_answer(pending_lesson, text)
+        msg = "📚 *Разбор твоего ответа:*\n\n"
+        msg += feedback
+        await _send_long(reply, msg)
+        return
+
+    res = await classify(text)
+    log.info("CLS: %s", res.get("type"))
+    t = res["type"]
 
     if t == "cmd_digest":
         msg, kb = build_digest()
@@ -1157,6 +1237,16 @@ async def process_text(text: str, update: Update, context: ContextTypes.DEFAULT_
         await update.effective_chat.send_action("typing")
         answer = await ask_claude(res["text"])
         await reply(f"💬 {answer}")
+
+    elif t == "english_lesson_start":
+        set_state("pending_english_lesson", res["prompt"])
+        await reply(
+            f"📝 *Урок начат!*\n\n"
+            f"*Задание:* {res['prompt']}\n\n"
+            f"Пиши свой ответ на английском 👇\n"
+            f"_(Отправь «отмена» чтобы выйти из урока)_",
+            parse_mode="Markdown",
+        )
 
 
 # ═══════════════════════ Telegram handlers ═══════════════════════
@@ -1545,7 +1635,7 @@ async def run():
         days=(6,), name="weekly_report",
     )
 
-    log.info("🤖 STK Bot v2.3 starting — NO habits, NO business terms, move-button, personal-default")
+    log.info("🤖 STK Bot v3.1 starting — deep error analysis + flexible gym + pinned daily card")
     log.info("   OWNER=%s  NOTION=%s  VOICE=%s  LLM_CLS=%s  CITY=%s",
              OWNER_ID,
              "ON" if NOTION_ENABLED else "OFF",
