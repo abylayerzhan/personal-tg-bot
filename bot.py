@@ -1096,6 +1096,42 @@ async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
         await update.message.reply_text(f"💬 {answer}")
 
 
+async def _remove_button_or_finish(q, callback_data: str, mark: str = "✅"):
+    """Убирает кнопку с указанным callback_data из inline-клавиатуры сообщения.
+
+    Если в сообщении была только одна кнопка (или это карточка задачи) —
+    заменяет текст на «✅ Выполнено». Если кнопок несколько (список /tasks) —
+    убирает только нажатую, остальные оставляет.
+    """
+    try:
+        old = q.message.reply_markup
+        if not old or not old.inline_keyboard:
+            await q.answer(f"{mark} Готово")
+            return
+
+        new_rows = []
+        for row in old.inline_keyboard:
+            new_row = [b for b in row if b.callback_data != callback_data]
+            if new_row:
+                new_rows.append(new_row)
+
+        if new_rows:
+            # Кнопки остались — убираем только нажатую
+            await q.edit_message_reply_markup(InlineKeyboardMarkup(new_rows))
+            await q.answer(f"{mark} выполнено")
+        else:
+            # Кнопок не осталось → это была одиночная карточка задачи
+            try:
+                await q.edit_message_text(
+                    text=(q.message.text or "") + f"\n\n{mark} Выполнено!",
+                )
+            except Exception:
+                await q.answer(f"{mark} выполнено")
+    except Exception as e:
+        log.warning("_remove_button_or_finish: %s", e)
+        await q.answer(f"{mark} выполнено")
+
+
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -1119,14 +1155,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("task_done:"):
         tid = int(data.split(":")[1])
         nid = complete_task(tid)
+        if nid is None:
+            await q.answer("⚠️ Уже выполнено")
+            return
         if nid:
             await sync_task_done(nid)
-        try:
-            await q.edit_message_text(
-                text=q.message.text + "\n\n✅ Выполнено!",
-            )
-        except Exception:
-            pass
+        # Если кнопка была в списке /tasks — убираем именно эту строку
+        await _remove_button_or_finish(q, data, "✅")
         return
 
     # Задача — удалить
@@ -1195,10 +1230,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await notion.update_page(nid, {"Done": prop_check(True)})
             except Exception:
                 pass
-        try:
-            await q.edit_message_text(q.message.text + "\n\n✅ Выполнено")
-        except Exception:
-            await q.answer("✅ Выполнено")
+        await _remove_button_or_finish(q, data, "✅")
         return
 
     # Идея — удалить
@@ -1442,8 +1474,7 @@ async def setup_bot_menu(app: Application):
 async def send_open_tasks(send_fn):
     """Отправляет список открытых задач/идей с кнопками выполнения.
 
-    send_fn — callable, который принимает (text, reply_markup) и отправляет.
-    Используется и /tasks, и утренней рассылкой.
+    Каждая задача — одна большая кнопка с текстом задачи. Нажал → исчезает.
     """
     stk_u = get_open_tasks(project="stk", priority="urgent")
     stk_i = get_open_tasks(project="stk", priority="important")
@@ -1461,25 +1492,23 @@ async def send_open_tasks(send_fn):
         await send_fn("📋 *Открытые задачи*\n\n_всё чисто 🎉_", None)
         return
 
-    # Заголовок отдельным сообщением (без кнопок)
-    await send_fn("📋 *Открытые задачи на сегодня*", None)
+    await send_fn("📋 *Открытые задачи на сегодня*\n_нажми на задачу — она выполнится_", None)
 
-    # Каждая задача — отдельным сообщением с кнопкой
     for label, items, kind in sections:
         if not items:
             continue
-        # Хедер секции
-        await send_fn(f"━━ *{label} ({len(items)})* ━━", None)
+        # Заголовок секции + кнопки задач в одном сообщении
+        header = f"━━ *{label} ({len(items)})* ━━"
+        rows = []
         for it in items:
             text = it["text"]
             iid = it["id"]
-            cb_done = f"task_done:{iid}" if kind == "task" else f"idea_done:{iid}"
-            cb_del = f"task_del:{iid}" if kind == "task" else f"idea_del:{iid}"
-            kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ Готово", callback_data=cb_done),
-                InlineKeyboardButton("❌", callback_data=cb_del),
-            ]])
-            await send_fn(f"☐ {md_escape(text)}", kb)
+            cb = f"task_done:{iid}" if kind == "task" else f"idea_done:{iid}"
+            # Ограничим длину кнопки — Telegram режет на 64 байта
+            label_btn = text if len(text) <= 50 else text[:47] + "…"
+            rows.append([InlineKeyboardButton(f"☐ {label_btn}", callback_data=cb)])
+        kb = InlineKeyboardMarkup(rows)
+        await send_fn(header, kb)
 
 
 async def cmd_tasks_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1532,7 +1561,7 @@ async def run():
     jq.run_daily(reminder_23_job, time=dtime(23, 0), name="rem_23")
     jq.run_daily(reminder_00_job, time=dtime(0, 0), name="rem_00")
 
-    log.info("🤖 STK Bot v3.4 starting — task buttons in /tasks + morning tasks at 7:00")
+    log.info("🤖 STK Bot v3.5 starting — single-tap task done (no Готово/X buttons)")
     log.info("   OWNER_ID=%s", OWNER_ID)
     log.info("   ANTHROPIC=%s GROQ=%s OPENAI=%s",
              "ON" if ANTHROPIC_KEY else "OFF",
