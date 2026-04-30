@@ -89,6 +89,8 @@ def init_db():
             category TEXT NOT NULL DEFAULT 'business',
             text TEXT NOT NULL,
             notion_id TEXT,
+            done INTEGER DEFAULT 0,
+            done_at INTEGER,
             created_at INTEGER NOT NULL
         );
 
@@ -121,6 +123,13 @@ def init_db():
             value TEXT
         );
     """)
+    c.commit()
+    # Миграция для старых БД: добавить done/done_at в ideas если их нет
+    for col_def in ("done INTEGER DEFAULT 0", "done_at INTEGER"):
+        try:
+            c.execute(f"ALTER TABLE ideas ADD COLUMN {col_def}")
+        except Exception:
+            pass  # колонка уже есть
     c.commit()
     c.close()
 
@@ -323,10 +332,11 @@ async def sync_task_to_notion(project: str, priority: str, text: str) -> str | N
     if not db_id:
         return None
     pri_map = {"urgent": "🔴 Срочно", "important": "🟡 Важно", "strategic": "🟢 Стратегия"}
+    # Не отправляем Status — у баз STK/CLOQ его может не быть.
+    # Если в базе есть Done checkbox или Status — Notion заполнит default.
     props = {
         "Name": prop_title(text),
         "Priority": prop_select(pri_map.get(priority, "🔴 Срочно")),
-        "Status": prop_status("Not started"),
     }
     return await notion.create_page(db_id, props)
 
@@ -334,8 +344,10 @@ async def sync_task_to_notion(project: str, priority: str, text: str) -> str | N
 async def sync_task_done(notion_id: str) -> bool:
     if not notion or not notion_id:
         return False
+    # Используем Done checkbox (есть во всех базах). Если у базы есть Status —
+    # его можно поменять автоматизацией Notion (formula/automation).
     return await notion.update_page(notion_id, {
-        "Status": prop_status("Done"),
+        "Done": prop_check(True),
     })
 
 
@@ -685,6 +697,21 @@ def complete_task(tid):
     return nid
 
 
+def complete_idea(iid):
+    """Помечает идею выполненной. Возвращает notion_id если был."""
+    c = db()
+    row = c.execute("SELECT notion_id FROM ideas WHERE id=? AND done=0", (iid,)).fetchone()
+    if not row:
+        c.close()
+        return None
+    c.execute("UPDATE ideas SET done=1, done_at=? WHERE id=?",
+              (int(datetime.now().timestamp()), iid))
+    c.commit()
+    nid = row["notion_id"]
+    c.close()
+    return nid
+
+
 def get_open_tasks(project=None, priority=None, limit=10):
     c = db()
     q = "SELECT * FROM tasks WHERE done=0"
@@ -1013,8 +1040,9 @@ async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
         iid = add_idea(res["category"], res["text"], nid)
         labels = {"business": "💡 Бизнес-идея", "marketing": "🎯 Маркетинг", "personal": "🏃 Личное"}
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔄 Переместить", callback_data=f"idea_move:{iid}"),
-             InlineKeyboardButton("❌ Удалить", callback_data=f"idea_del:{iid}")],
+            [InlineKeyboardButton("✅ Готово", callback_data=f"idea_done:{iid}"),
+             InlineKeyboardButton("🔄 Переместить", callback_data=f"idea_move:{iid}")],
+            [InlineKeyboardButton("❌ Удалить", callback_data=f"idea_del:{iid}")],
         ])
         sync_mark = " ☁️" if nid else ""
         await update.message.reply_text(
@@ -1101,6 +1129,19 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         return
 
+    # Задача — удалить
+    if data.startswith("task_del:"):
+        tid = int(data.split(":")[1])
+        c = db()
+        c.execute("DELETE FROM tasks WHERE id=?", (tid,))
+        c.commit()
+        c.close()
+        try:
+            await q.edit_message_text(q.message.text + "\n\n❌ Удалено")
+        except Exception:
+            pass
+        return
+
     # Задача — переместить (циклически)
     if data.startswith("task_move:"):
         tid = int(data.split(":")[1])
@@ -1139,6 +1180,25 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
         await q.answer(f"→ {proj} {nxt[1]}")
+        return
+
+    # Идея — выполнено
+    if data.startswith("idea_done:"):
+        iid = int(data.split(":")[1])
+        nid = complete_idea(iid)
+        if nid is None:
+            await q.answer("⚠️ Уже выполнено")
+            return
+        # Если есть notion_id — пометим в Notion как Done
+        if notion and nid:
+            try:
+                await notion.update_page(nid, {"Done": prop_check(True)})
+            except Exception:
+                pass
+        try:
+            await q.edit_message_text(q.message.text + "\n\n✅ Выполнено")
+        except Exception:
+            await q.answer("✅ Выполнено")
         return
 
     # Идея — удалить
@@ -1379,38 +1439,70 @@ async def setup_bot_menu(app: Application):
 
 
 # ─────────── Main ───────────
-async def cmd_tasks_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/tasks — все открытые задачи."""
+async def send_open_tasks(send_fn):
+    """Отправляет список открытых задач/идей с кнопками выполнения.
+
+    send_fn — callable, который принимает (text, reply_markup) и отправляет.
+    Используется и /tasks, и утренней рассылкой.
+    """
     stk_u = get_open_tasks(project="stk", priority="urgent")
     stk_i = get_open_tasks(project="stk", priority="important")
     cloq = get_open_tasks(project="cloq")
-    pers = get_personal_ideas(8)
+    pers = get_personal_ideas(15)
 
-    msg = "📋 *Открытые задачи*\n\n"
-    if stk_u:
-        msg += f"🔴 *STK · Срочно ({len(stk_u)}):*\n"
-        for t in stk_u:
-            msg += f"  ☐ {md_escape(t['text'][:50])}\n"
-        msg += "\n"
-    if stk_i:
-        msg += f"🟡 *STK · Важно ({len(stk_i)}):*\n"
-        for t in stk_i:
-            msg += f"  ☐ {md_escape(t['text'][:50])}\n"
-        msg += "\n"
-    if cloq:
-        msg += f"⌚ *CLOQ ({len(cloq)}):*\n"
-        for t in cloq:
-            msg += f"  ☐ {md_escape(t['text'][:50])}\n"
-        msg += "\n"
-    if pers:
-        msg += f"🏃 *Личное ({len(pers)}):*\n"
-        for p in pers:
-            msg += f"  • {md_escape(p['text'][:50])}\n"
+    sections = [
+        ("🔴 STK · Срочно", stk_u, "task"),
+        ("🟡 STK · Важно", stk_i, "task"),
+        ("⌚ CLOQ", cloq, "task"),
+        ("🏃 Личное", pers, "idea"),
+    ]
 
-    if not (stk_u or stk_i or cloq or pers):
-        msg += "_всё чисто 🎉_"
+    if not any(items for _, items, _ in sections):
+        await send_fn("📋 *Открытые задачи*\n\n_всё чисто 🎉_", None)
+        return
 
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+    # Заголовок отдельным сообщением (без кнопок)
+    await send_fn("📋 *Открытые задачи на сегодня*", None)
+
+    # Каждая задача — отдельным сообщением с кнопкой
+    for label, items, kind in sections:
+        if not items:
+            continue
+        # Хедер секции
+        await send_fn(f"━━ *{label} ({len(items)})* ━━", None)
+        for it in items:
+            text = it["text"]
+            iid = it["id"]
+            cb_done = f"task_done:{iid}" if kind == "task" else f"idea_done:{iid}"
+            cb_del = f"task_del:{iid}" if kind == "task" else f"idea_del:{iid}"
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Готово", callback_data=cb_done),
+                InlineKeyboardButton("❌", callback_data=cb_del),
+            ]])
+            await send_fn(f"☐ {md_escape(text)}", kb)
+
+
+async def cmd_tasks_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/tasks — все открытые задачи с кнопками."""
+    async def send(text, kb):
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+    await send_open_tasks(send)
+
+
+async def morning_tasks_job(context: ContextTypes.DEFAULT_TYPE):
+    """Утренняя рассылка задач — после карточки дня."""
+    chat_id = OWNER_ID or int(get_state("last_chat_id", 0) or 0)
+    if not chat_id:
+        return
+    bot = context.bot
+
+    async def send(text, kb):
+        await bot.send_message(
+            chat_id=chat_id, text=text,
+            parse_mode=ParseMode.MARKDOWN, reply_markup=kb,
+        )
+    await send_open_tasks(send)
+    log.info("morning tasks sent")
 
 
 async def run():
@@ -1432,6 +1524,7 @@ async def run():
     # Cron jobs
     jq = app.job_queue
     jq.run_daily(morning_card_job, time=dtime(5, 0), name="morning_card")
+    jq.run_daily(morning_tasks_job, time=dtime(7, 0), name="morning_tasks")
     jq.run_daily(reminder_11_job, time=dtime(11, 0), name="rem_11")
     jq.run_daily(reminder_15_job, time=dtime(15, 0), name="rem_15")
     jq.run_daily(reminder_19_job, time=dtime(19, 0), name="rem_19")
@@ -1439,7 +1532,7 @@ async def run():
     jq.run_daily(reminder_23_job, time=dtime(23, 0), name="rem_23")
     jq.run_daily(reminder_00_job, time=dtime(0, 0), name="rem_00")
 
-    log.info("🤖 STK Bot v3.2 starting — pinned daily card + flexible gym + streaks (no english)")
+    log.info("🤖 STK Bot v3.4 starting — task buttons in /tasks + morning tasks at 7:00")
     log.info("   OWNER_ID=%s", OWNER_ID)
     log.info("   ANTHROPIC=%s GROQ=%s OPENAI=%s",
              "ON" if ANTHROPIC_KEY else "OFF",
