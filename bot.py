@@ -684,32 +684,39 @@ def add_reminder_db(text, dt, chat_id, kind="general"):
 
 
 def complete_task(tid):
+    """Помечает задачу выполненной. Возвращает (found, notion_id)."""
     c = db()
-    row = c.execute("SELECT notion_id FROM tasks WHERE id=? AND done=0", (tid,)).fetchone()
+    row = c.execute("SELECT notion_id, done FROM tasks WHERE id=?", (tid,)).fetchone()
     if not row:
         c.close()
-        return None
-    c.execute("UPDATE tasks SET done=1, done_at=? WHERE id=?",
-              (int(datetime.now().timestamp()), tid))
-    c.commit()
+        log.warning("complete_task: id=%s not found", tid)
+        return (False, None)
     nid = row["notion_id"]
+    if not row["done"]:
+        c.execute("UPDATE tasks SET done=1, done_at=? WHERE id=?",
+                  (int(datetime.now().timestamp()), tid))
+        c.commit()
     c.close()
-    return nid
+    return (True, nid)
 
 
 def complete_idea(iid):
-    """Помечает идею выполненной. Возвращает notion_id если был."""
+    """Помечает идею выполненной. Возвращает (found, notion_id).
+    found=True даже если уже была done — главное что строка существует.
+    """
     c = db()
-    row = c.execute("SELECT notion_id FROM ideas WHERE id=? AND done=0", (iid,)).fetchone()
+    row = c.execute("SELECT notion_id, done FROM ideas WHERE id=?", (iid,)).fetchone()
     if not row:
         c.close()
-        return None
-    c.execute("UPDATE ideas SET done=1, done_at=? WHERE id=?",
-              (int(datetime.now().timestamp()), iid))
-    c.commit()
+        log.warning("complete_idea: id=%s not found in DB", iid)
+        return (False, None)
     nid = row["notion_id"]
+    if not row["done"]:
+        c.execute("UPDATE ideas SET done=1, done_at=? WHERE id=?",
+                  (int(datetime.now().timestamp()), iid))
+        c.commit()
     c.close()
-    return nid
+    return (True, nid)
 
 
 def get_open_tasks(project=None, priority=None, limit=10):
@@ -1154,13 +1161,16 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Задача — выполнено
     if data.startswith("task_done:"):
         tid = int(data.split(":")[1])
-        nid = complete_task(tid)
-        if nid is None:
-            await q.answer("⚠️ Уже выполнено")
-            return
+        found, nid = complete_task(tid)
+        if not found:
+            # Задача удалена из БД — всё равно убираем кнопку из сообщения
+            log.info("task_done: %s not found, removing button anyway", tid)
         if nid:
-            await sync_task_done(nid)
-        # Если кнопка была в списке /tasks — убираем именно эту строку
+            try:
+                await sync_task_done(nid)
+            except Exception as e:
+                log.warning("sync_task_done error: %s", e)
+        # Всегда убираем кнопку — даже если в БД были странности
         await _remove_button_or_finish(q, data, "✅")
         return
 
@@ -1220,16 +1230,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Идея — выполнено
     if data.startswith("idea_done:"):
         iid = int(data.split(":")[1])
-        nid = complete_idea(iid)
-        if nid is None:
-            await q.answer("⚠️ Уже выполнено")
-            return
-        # Если есть notion_id — пометим в Notion как Done
+        found, nid = complete_idea(iid)
+        if not found:
+            log.info("idea_done: %s not found, removing button anyway", iid)
         if notion and nid:
             try:
                 await notion.update_page(nid, {"Done": prop_check(True)})
-            except Exception:
-                pass
+            except Exception as e:
+                log.warning("notion idea done error: %s", e)
+        # Всегда убираем кнопку — независимо от результата
         await _remove_button_or_finish(q, data, "✅")
         return
 
@@ -1561,7 +1570,7 @@ async def run():
     jq.run_daily(reminder_23_job, time=dtime(23, 0), name="rem_23")
     jq.run_daily(reminder_00_job, time=dtime(0, 0), name="rem_00")
 
-    log.info("🤖 STK Bot v3.5 starting — single-tap task done (no Готово/X buttons)")
+    log.info("🤖 STK Bot v3.6 starting — task button removal fixed (idempotent + always remove)")
     log.info("   OWNER_ID=%s", OWNER_ID)
     log.info("   ANTHROPIC=%s GROQ=%s OPENAI=%s",
              "ON" if ANTHROPIC_KEY else "OFF",
