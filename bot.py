@@ -665,10 +665,12 @@ async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
     elif t == "task":
         tid = add_task(res["project"], res["text"])
         proj_label = "🌹 *STK*" if res["project"] == "stk" else "⌚ *CLOQ*"
+        other_label = "→ CLOQ" if res["project"] == "stk" else "→ STK"
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ Готово", callback_data=f"task_done:{tid}"),
-             InlineKeyboardButton("🔄 → CLOQ" if res["project"] == "stk" else "🔄 → STK",
-                                  callback_data=f"task_move:{tid}")],
+             InlineKeyboardButton("❌ Удалить", callback_data=f"task_del:{tid}")],
+            [InlineKeyboardButton(other_label, callback_data=f"task_move:{tid}"),
+             InlineKeyboardButton("→ 🏃 Личное", callback_data=f"task_to_personal:{tid}")],
         ])
         await update.message.reply_text(
             f"{proj_label}\n\n☐ {md_escape(res['text'])}",
@@ -780,10 +782,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         c.commit()
         c.close()
         proj_label = "🌹 *STK*" if nxt == "stk" else "⌚ *CLOQ*"
+        other_label = "→ CLOQ" if nxt == "stk" else "→ STK"
         new_kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ Готово", callback_data=f"task_done:{tid}"),
-             InlineKeyboardButton("🔄 → CLOQ" if nxt == "stk" else "🔄 → STK",
-                                  callback_data=f"task_move:{tid}")],
+             InlineKeyboardButton("❌ Удалить", callback_data=f"task_del:{tid}")],
+            [InlineKeyboardButton(other_label, callback_data=f"task_move:{tid}"),
+             InlineKeyboardButton("→ 🏃 Личное", callback_data=f"task_to_personal:{tid}")],
         ])
         try:
             new_text = re.sub(
@@ -795,6 +799,40 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
         await q.answer(f"→ {nxt.upper()}")
+        return
+
+    # Задача → Личное (превращается в idea с category=personal)
+    if data.startswith("task_to_personal:"):
+        tid = int(data.split(":")[1])
+        c = db()
+        r = c.execute("SELECT text FROM tasks WHERE id=?", (tid,)).fetchone()
+        if not r:
+            c.close()
+            await q.answer("⚠️ Не найдено")
+            return
+        text = r["text"]
+        c.execute("DELETE FROM tasks WHERE id=?", (tid,))
+        cur = c.execute(
+            "INSERT INTO ideas(category,text,created_at) VALUES(?,?,?)",
+            ("personal", text, int(datetime.now().timestamp())),
+        )
+        new_iid = cur.lastrowid
+        c.commit()
+        c.close()
+        new_kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Готово", callback_data=f"idea_done:{new_iid}"),
+             InlineKeyboardButton("❌ Удалить", callback_data=f"idea_del:{new_iid}")],
+            [InlineKeyboardButton("🔄 Переместить", callback_data=f"idea_move:{new_iid}")],
+        ])
+        try:
+            await q.edit_message_text(
+                f"🏃 *Личное*\n\n☐ {md_escape(text)}",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=new_kb,
+            )
+        except Exception:
+            pass
+        await q.answer("→ 🏃 Личное")
         return
 
     # Идея — выполнено
